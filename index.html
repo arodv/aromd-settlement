@@ -69,8 +69,8 @@ input,select{border:1.5px solid #c9d7bf;border-radius:11px;background:#fffef9}in
 <dialog id="rates-dialog"><div class="dialog-header"><h2>2026 가을 정산율</h2><button type="button" class="btn close-rates">✕ 닫기</button></div><div class="dialog-body"><p class="muted">A 두 매장, B 두 매장은 각각 같은 분류 요율을 적용합니다. 옵션 인정매출과 쇼핑매출로 구간을 정합니다.</p><div class="table-wrap"><table class="rates-table"><thead><tr><th>쌍당 인정매출 USD</th><th>A</th><th>B</th><th>C</th><th>옵션</th></tr></thead><tbody id="rates-body"></tbody></table></div><p class="muted">소수점 평균을 미리 반올림하지 않습니다. $2,200.99는 $2,201 미만이므로 이전 구간입니다.</p><button type="button" class="btn close-rates">정산표 닫기</button></div></dialog>
 <dialog id="confirm-dialog"><h2 id="dialog-title"></h2><p id="dialog-text"></p><div class="buttons"><button class="btn" id="dialog-cancel">취소</button><button class="btn primary" id="dialog-confirm">확인</button></div></dialog><div id="toast" role="status" hidden></div>
 <script>'use strict';
-const RULE_VERSION='2026-reconciliation-v4';
-const PREVIOUS_VERSIONS=['2026-reconciliation-v2','2026-reconciliation-v3'];
+const RULE_VERSION='2026-reconciliation-v5';
+const PREVIOUS_VERSIONS=['2026-reconciliation-v2','2026-reconciliation-v3','2026-reconciliation-v4'];
 const ASSOCIATION_PER_COUPLE=200;
 const LEGACY_VERSION='2026-autumn-v1';
 const KEY='aromd.public-review.records.v1', PREF='aromd.reconciliation.preferences.v2';
@@ -79,15 +79,23 @@ const SALE_IDS=['sale-a','sale-a-honey','sale-b','sale-b-latex','sale-c','sale-o
 const TIERS=[{min:0,max:1000,r:[0,0,0,0]},{min:1001,max:1600,r:[10,7,5,10]},{min:1601,max:1800,r:[11,8,5,15]},{min:1801,max:2200,r:[16,10,5,20]},{min:2201,max:2400,r:[19,11,5,20]},{min:2401,max:2500,r:[21,12,5,20]},{min:2501,max:2700,r:[21,12,10,25]},{min:2701,max:3000,r:[22,13,10,25]},{min:3001,max:3200,r:[24,14,10,25]},{min:3201,max:3400,r:[26,16,10,25]},{min:3401,max:3600,r:[27,18,10,25]},{min:3601,max:4000,r:[30,20,10,25]},{min:4001,max:5000,r:[32,22,10,25]},{min:5001,max:null,r:[33,23,11,25]}];
 const CAR={1:0,2:6000,3:7500,4:8000,5:8500};
 const A_PROFILES={registered:{label:'2026 가을 · 회사 정산율표',rows:TIERS.map(t=>[t.min,t.r[0]])}};
-const round=n=>Math.round((n+Number.EPSILON)*100)/100;
+// Keep decimal inputs and THB/USD divisions exact until the final money rounding.
+function decimal(n){const [m,e='0']=String(n).toLowerCase().split('e'),parts=m.split('.'),digits=parts.join(''),scale=(parts[1]?.length??0)-Number(e);return scale>=0?[BigInt(digits),10n**BigInt(scale)]:[BigInt(digits)*10n**BigInt(-scale),1n];}
+const addR=(a,b)=>[a[0]*b[1]+b[0]*a[1],a[1]*b[1]],mulR=(a,b)=>[a[0]*b[0],a[1]*b[1]],divR=(a,b)=>[a[0]*b[1],a[1]*b[0]];
+function valueR(a){const n=Number(a[0]),d=Number(a[1]);if(Number.isFinite(n)&&Number.isFinite(d))return n/d;const ns=(a[0]<0n?-a[0]:a[0]).toString(),ds=a[1].toString(),head=s=>Number(s.slice(0,16))/10**(Math.min(s.length,16)-1);return (a[0]<0n?-1:1)*head(ns)/head(ds)*10**(ns.length-ds.length);}
+const sumR=values=>values.reduce(addR,[0n,1n]);
+function roundR(a,places=2){const scale=10n**BigInt(places),n=2n*a[0]*scale+a[1],d=2n*a[1],integer=n>=0n?n/d:-((-n+d-1n)/d);return Number(integer)/Number(scale);}
+const round=n=>Number.isFinite(n)?roundR(decimal(n)):n;
+const sumMoney=values=>roundR(sumR(values.map(decimal)));
 const finite=n=>typeof n==='number'&&Number.isFinite(n);
 const bounded=(n,min=0,max=1e8)=>finite(n)&&n>=min&&n<=max;
 function validDate(d){if(typeof d!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(d))return false;const x=new Date(d+'T00:00:00Z');return Number.isFinite(x.getTime())&&x.toISOString().slice(0,10)===d;}
-function tierFor(total,couples,profile='registered'){
- let base=TIERS[0];for(const t of TIERS)if(total>=t.min*couples)base=t;
- const rows=A_PROFILES[profile].rows;let a=rows[0][1];for(const [min,rate] of rows)if(total>=min*couples)a=rate;
+function tierFor(total,couples,profile='registered',exactTotal=null){
+ const reached=min=>exactTotal?exactTotal[0]>=BigInt(min*couples)*exactTotal[1]:total>=min*couples;
+ let base=TIERS[0];for(const t of TIERS)if(reached(t.min))base=t;
+ const rows=A_PROFILES[profile].rows;let a=rows[0][1];for(const [min,rate] of rows)if(reached(min))a=rate;
  const boundaries=[...new Set([...TIERS.map(t=>t.min),...rows.map(t=>t[0])])].sort((a,b)=>a-b);
- const index=boundaries.findLastIndex(min=>total>=min*couples);
+ const index=boundaries.findLastIndex(reached);
  return {min:boundaries[index],max:boundaries[index+1]===undefined?null:boundaries[index+1]-1,r:[a,...base.r.slice(1)]};
 }
 function calculate(d){
@@ -101,10 +109,13 @@ function calculate(d){
  if(d.optionRecognized===null){if(d.sales?.[5]>0)errors.push('옵션 인정매출을 별도로 입력해 주세요. 정산매출과 다른 금액입니다.');}
  else if(!bounded(d.optionRecognized))errors.push('옵션 인정매출을 확인해 주세요.');
  if(errors.length)return {errors,car,association};
- const recognizedOption=d.optionRecognized??0,shopSales=d.sales.slice(0,5).reduce((a,b)=>a+b,0);
- const total=shopSales+recognizedOption,settlementTotal=d.sales.reduce((a,b)=>a+b,0),average=total/d.couples;
- const tier=tierFor(total,d.couples,d.aProfile),rates=[tier.r[0],tier.r[0],tier.r[1],tier.r[1],tier.r[2],tier.r[3]];
- const rawFees=d.sales.map((v,i)=>v*rates[i]/100),fees=rawFees.map(round),feeTotal=round(rawFees.reduce((a,b)=>a+b,0));
+ const source=d.optionSource,exactSales=d.sales.map(decimal);
+ if(source?.result&&bounded(source.inputs?.tmFx,0.0001,1000)&&bounded(source.result.settlementThb))exactSales[5]=divR(decimal(source.result.settlementThb),decimal(source.inputs.tmFx));
+ const exactRecognized=source?.result&&bounded(source.inputs?.tmFx,0.0001,1000)&&bounded(source.result.recognizedThb)?divR(decimal(source.result.recognizedThb),decimal(source.inputs.tmFx)):decimal(d.optionRecognized??0);
+ const exactShop=sumR(exactSales.slice(0,5)),exactTotal=addR(exactShop,exactRecognized),recognizedOption=valueR(exactRecognized),shopSales=valueR(exactShop);
+ const total=valueR(exactTotal),settlementTotal=valueR(sumR(exactSales)),average=total/d.couples;
+ const tier=tierFor(total,d.couples,d.aProfile,exactTotal),rates=[tier.r[0],tier.r[0],tier.r[1],tier.r[1],tier.r[2],tier.r[3]];
+ const exactFees=exactSales.map((v,i)=>mulR(v,[BigInt(rates[i]),100n])),rawFees=exactFees.map(valueR),fees=exactFees.map(v=>roundR(v)),feeTotal=roundR(sumR(exactFees));
  const shopFx=d.fx,optionFx=d.optionFx===null?d.fx:d.optionFx;
  if(!bounded(shopFx,0.0001,1000))errors.push('샵 정산 적용환율을 입력해 주세요. 단위는 1달러당 바트입니다.');
  if(!bounded(optionFx,0.0001,1000))errors.push('옵션 정산 적용환율을 확인해 주세요.');
@@ -115,41 +126,47 @@ function calculate(d){
  if(d.bonusOverride!==null&&!bounded(d.bonusOverride))errors.push('매출 보너스 금액을 확인해 주세요.');
  for(const key of ['actual','actualKrw'])if(d[key]!==null&&!bounded(d[key],-1e12,1e12))errors.push('회사 지급액을 확인해 주세요.');
  if(d.krwFx!==null&&!bounded(d.krwFx,0.0001,1e6))errors.push('원화 환율을 확인해 주세요.');
- const bonus=d.bonusOverride!==null?d.bonusOverride:total>=4001*d.couples?d.couples*1000:0;
- const monetaryRound=d.rounding==='baht'?Math.round:round;
- const lineThb=rawFees.map((fee,i)=>bounded(i===5?optionFx:shopFx,0.0001,1000)?monetaryRound(fee*(i===5?optionFx:shopFx)):null);
+ const bonus=d.bonusOverride!==null?d.bonusOverride:exactTotal[0]>=BigInt(4001*d.couples)*exactTotal[1]?d.couples*1000:0;
+ const lineThb=exactFees.map((fee,i)=>bounded(i===5?optionFx:shopFx,0.0001,1000)?roundR(mulR(fee,decimal(i===5?optionFx:shopFx)),d.rounding==='baht'?0:2):null);
  const shopUsd=rawFees.slice(0,5).reduce((a,b)=>a+b,0),shopThb=lineThb.slice(0,5).every(finite)?round(lineThb.slice(0,5).reduce((a,b)=>a+b,0)):null,optionThb=lineThb[5];
  const gross=shopThb!==null&&optionThb!==null?round(shopThb+optionThb):null;
- const net=errors.length?null:round(gross-car+bonus+d.extraBonus-association+d.adjustment);
- const krwNet=net!==null&&d.krwFx!==null?Math.round(net*d.krwFx):null;
- return {errors,total,settlementTotal,recognizedOption,shopSales,average,tier,rates,rawFees,fees,feeTotal,lineThb,shopUsd,shopFx,optionFx,shopThb,optionThb,gross,car,bonus,association,net,krwNet,difference:net!==null&&d.actual!==null?round(d.actual-net):null,krwDifference:krwNet!==null&&d.actualKrw!==null?d.actualKrw-krwNet:null};
+ const net=errors.length?null:sumMoney([gross,-car,bonus,d.extraBonus,-association,d.adjustment]);
+ const krwNet=net!==null&&d.krwFx!==null?roundR(mulR(decimal(net),decimal(d.krwFx)),0):null;
+ return {errors,total,settlementTotal,recognizedOption,shopSales,average,tier,rates,rawFees,fees,feeTotal,lineThb,shopUsd,shopFx,optionFx,shopThb,optionThb,gross,car,bonus,association,net,krwNet,difference:net!==null&&d.actual!==null?sumMoney([d.actual,-net]):null,krwDifference:krwNet!==null&&d.actualKrw!==null?d.actualKrw-krwNet:null};
 }
-function optionAmounts(o){
+function optionAmounts(o,legacy=false){
  const errors=[];for(const key of ['extraThb','costThb'])if(!bounded(o[key]))errors.push('추가 T/M과 원가 공제액을 입력해 주세요.');
  if(!bounded(o.recognitionRate,0,100))errors.push('확인할 인정률을 0~100%로 입력해 주세요.');
  if(!bounded(o.tmFx,0.0001,1000))errors.push('T/M 달러 환산 환율을 입력해 주세요.');
  if(o.costThb>o.extraThb)errors.push('원가 공제액이 추가 T/M보다 큽니다.');
  if(errors.length)return {errors:[...new Set(errors)]};
- const recognizedThb=Math.round(o.extraThb*o.recognitionRate/100),settlementThb=round(o.extraThb-o.costThb);
+ const recognizedThb=legacy?Math.round(o.extraThb*o.recognitionRate/100):roundR(mulR(decimal(o.extraThb),divR(decimal(o.recognitionRate),[100n,1n])),0),settlementThb=legacy?Math.round((o.extraThb-o.costThb+Number.EPSILON)*100)/100:sumMoney([o.extraThb,-o.costThb]);
  return {errors,recognizedThb,settlementThb,recognizedUsd:recognizedThb/o.tmFx,settlementUsd:settlementThb/o.tmFx};
 }
+function reviewInput(input){const d={...input};if(d.optionSource){const inputs={...d.optionSource.inputs},result=optionAmounts(inputs);if(!result.errors.length){d.optionSource={inputs,result};d.optionRecognized=result.recognizedUsd;d.sales=[...d.sales];d.sales[5]=result.settlementUsd;}}return d;}
 function validSnapshot(c,n){return c&&['total','average','feeTotal','shopFx','optionFx','shopThb','optionThb','gross','car','bonus','net'].every(k=>finite(c[k]))&&Array.isArray(c.fees)&&c.fees.length===n&&c.fees.every(finite)&&c.tier&&Array.isArray(c.tier.r)&&c.tier.r.length===4&&c.tier.r.every(v=>bounded(v,0,100))&&bounded(c.tier.min)&& (c.tier.max===null||bounded(c.tier.max));}
 function validRecord(r){
  if(!r||typeof r.id!=='string'||!r.id||r.id.length>100||![RULE_VERSION,...PREVIOUS_VERSIONS,LEGACY_VERSION].includes(r.ruleVersion))return false;
  const d=r.input;if(!d||typeof d.name!=='string'||d.name.length>100||typeof d.bus!=='boolean'||!validDate(d.date)||!Number.isInteger(d.couples)||d.couples<1||d.couples>100||!Array.isArray(d.sales)||![4,6].includes(d.sales.length)||d.sales.some(v=>!bounded(v))||!validSnapshot(r.result,d.sales.length))return false;
- if(r.ruleVersion!==LEGACY_VERSION&&d.optionSource!=null){const s=d.optionSource;if(!s.inputs||!s.result)return false;const derived=optionAmounts(s.inputs);if(derived.errors.length||derived.recognizedUsd!==d.optionRecognized||derived.settlementUsd!==d.sales[5]||Object.keys(derived).filter(k=>k!=='errors').some(k=>s.result[k]!==derived[k]))return false;}
+ if(r.ruleVersion!==LEGACY_VERSION&&d.optionSource!=null){const s=d.optionSource;if(!s.inputs||!s.result)return false;const derived=optionAmounts(s.inputs,r.ruleVersion!==RULE_VERSION);if(derived.errors.length||derived.recognizedUsd!==d.optionRecognized||derived.settlementUsd!==d.sales[5]||Object.keys(derived).filter(k=>k!=='errors').some(k=>s.result[k]!==derived[k]))return false;}
  if(r.ruleVersion===LEGACY_VERSION)return true;
  const calculated=calculate(d);
  return calculated.errors.length===0&&(r.ruleVersion!==RULE_VERSION||(d.association===calculated.association&&r.result.association===calculated.association));
 }
 function validateRecords(data){if(!Array.isArray(data)||data.length>10000||data.some(r=>!validRecord(r))||new Set(data.map(r=>r.id)).size!==data.length)throw Error('기록 형식을 확인해 주세요. 원본 데이터는 변경하지 않았습니다.');return data;}
+function mergeRecords(original,next,latest){
+ const before=new Map(original.map(r=>[r.id,r])),after=new Map(next.map(r=>[r.id,r])),merged=new Map(latest.map(r=>[r.id,r])),same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+ for(const [id,old] of before){const changed=after.get(id);if(same(old,changed))continue;const current=merged.get(id);if(!same(current,old)&&!(current===undefined&&changed===undefined))throw Error('다른 탭에서 같은 기록이 변경되었습니다. 입력을 따로 보관한 뒤 새로고침해 최신 기록을 확인해 주세요.');if(changed)merged.set(id,changed);else merged.delete(id);}
+ for(const [id,r] of after)if(!before.has(id)){if(merged.has(id)&&!same(merged.get(id),r))throw Error('같은 번호의 다른 기록이 이미 있습니다. 최신 기록을 확인해 주세요.');merged.set(id,r);}
+ return validateRecords([...merged.values()]);
+}
 function weekOfMonth(date){return Math.ceil(Number(date.slice(8,10))/7);}
 
 // UI START
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=n=>Number(n).toLocaleString('ko-KR',{minimumFractionDigits:2,maximumFractionDigits:2}),integer=n=>Number(n).toLocaleString('ko-KR',{maximumFractionDigits:0}),usd=n=>'$'+fmt(n),thb=n=>fmt(n)+' ฿';
 const today=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
-const number=(id,nullable=false)=>$(id).value.trim()===''?(nullable?null:0):Number($(id).value);
+const number=(id,nullable=false)=>$(id).validity.badInput?NaN:$(id).value.trim()===''?(nullable?null:0):Number($(id).value);
 let records=[],editing=null,prefs={},storageBroken=false,sourceOption=null,reviewOf=null;
 try{const raw=localStorage.getItem(KEY);records=raw?validateRecords(JSON.parse(raw)):[];}catch(e){storageBroken=true;$('storage-warning').hidden=false;$('storage-warning').textContent='저장 기록을 읽지 못했습니다. 원본을 덮어쓰지 않도록 저장을 중지했습니다. 원본 백업을 먼저 내려받아 주세요.';}
 try{const candidate=JSON.parse(localStorage.getItem(PREF)||'{}');prefs=candidate&&typeof candidate==='object'&&!Array.isArray(candidate)?candidate:{};prefs.aProfile='registered';if(!['baht','satang'].includes(prefs.rounding))prefs.rounding='baht';}catch(e){prefs={};}
@@ -193,7 +210,11 @@ function renderCalc(){
 }
 function optionPending(){return sourceOption&&JSON.stringify(readOption())!==JSON.stringify(sourceOption.inputs);}
 function renderOption(){const o=readOption(),r=optionAmounts(o);$('op-apply').disabled=!!r.errors.length;$('op-result').textContent=r.errors.length?r.errors.join(' '):`인정매출 ${fmt(r.recognizedThb)}바트 → ${usd(r.recognizedUsd)} / 정산매출 ${fmt(r.settlementThb)}바트 → ${usd(r.settlementUsd)}. 달러 환산값은 반올림하지 않고 계산에 사용합니다.${optionPending()?' 변경한 원본 값은 아직 반영되지 않았습니다. 반영 버튼을 눌러주세요.':''}`;return r;}
-function persist(next){if(storageBroken)throw Error('기존 기록을 읽지 못해 저장을 중지했습니다. 먼저 원본을 백업해 주세요.');localStorage.setItem(KEY,JSON.stringify(next));records=next;}
+async function persist(next){
+ const original=records;
+ const save=()=>{if(storageBroken)throw Error('기존 기록을 읽지 못해 저장을 중지했습니다. 먼저 원본을 백업해 주세요.');const raw=localStorage.getItem(KEY),latest=raw?validateRecords(JSON.parse(raw)):[],merged=mergeRecords(original,next,latest);localStorage.setItem(KEY,JSON.stringify(merged));records=merged;};
+ if(navigator.locks?.request)await navigator.locks.request(KEY,save);else save();
+}
 function refreshCounts(){$('record-count').textContent=records.length?'· '+records.length:'';}
 function selectedRecords(month){return records.filter(r=>!month||r.input.date.slice(0,7)===month).sort((a,b)=>b.input.date.localeCompare(a.input.date)||String(b.createdAt).localeCompare(String(a.createdAt)));}
 function switchTab(tab){document.querySelectorAll('nav button').forEach(b=>{b.classList.toggle('active',b.dataset.tab===tab);b.setAttribute('aria-current',b.dataset.tab===tab?'page':'false');});for(const id of ['calc','history','stats'])$(id+'-view').hidden=id!==tab;if(tab==='history')renderHistory();if(tab==='stats')renderStats();}
@@ -215,16 +236,16 @@ renderStats=function(){
 function download(content,name,type){const url=URL.createObjectURL(new Blob([content],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
 $('settlement-form').addEventListener('input',e=>{if(['sale-option','option-recognized'].includes(e.target.id))sourceOption=null;renderCalc();renderOption();});
 $('settlement-form').addEventListener('change',()=>{renderCalc();renderOption();});
-$('settlement-form').addEventListener('submit',e=>{e.preventDefault();const d=readInput(),c=calculate(d),errors=[...c.errors];if(optionPending())errors.push('변경한 옵션 원본 값을 반영 버튼으로 적용한 뒤 저장해 주세요.');if(!validDate(d.date))errors.push('정산 날짜를 입력해 주세요.');if(errors.length){$('form-error').textContent=errors.join(' ');$('form-error').hidden=false;return;}try{const now=new Date().toISOString(),id=editing??crypto.randomUUID(),old=records.find(r=>r.id===id),r={id,ruleVersion:RULE_VERSION,input:d,result:c,createdAt:old?.createdAt??now,updatedAt:now};persist(old?records.map(x=>x.id===id?r:x):[...records,r]);editing=id;prefs={fx:d.fx,optionFx:d.optionFx,krwFx:d.krwFx,aProfile:d.aProfile,rounding:d.rounding};try{localStorage.setItem(PREF,JSON.stringify(prefs));}catch(err){};$('editing-chip').hidden=false;$('form-title').textContent='저장된 팀 정산';$('save-btn').textContent='수정 내용 저장';$('form-error').hidden=true;refreshCounts();toast('정산을 저장했습니다.');}catch(err){$('form-error').textContent='저장하지 못했습니다. '+err.message;$('form-error').hidden=false;}});
+$('settlement-form').addEventListener('submit',async e=>{e.preventDefault();const d=readInput(),c=calculate(d),errors=[...c.errors];if(optionPending())errors.push('변경한 옵션 원본 값을 반영 버튼으로 적용한 뒤 저장해 주세요.');if(!validDate(d.date))errors.push('정산 날짜를 입력해 주세요.');if(errors.length){$('form-error').textContent=errors.join(' ');$('form-error').hidden=false;return;}$('save-btn').disabled=true;try{const now=new Date().toISOString(),id=editing??crypto.randomUUID(),old=records.find(r=>r.id===id),r={id,ruleVersion:RULE_VERSION,input:d,result:c,createdAt:old?.createdAt??now,updatedAt:now};await persist(old?records.map(x=>x.id===id?r:x):[...records,r]);editing=id;prefs={fx:d.fx,optionFx:d.optionFx,krwFx:d.krwFx,aProfile:d.aProfile,rounding:d.rounding};try{localStorage.setItem(PREF,JSON.stringify(prefs));}catch(err){};$('editing-chip').hidden=false;$('form-title').textContent='저장된 팀 정산';$('save-btn').textContent='수정 내용 저장';$('form-error').hidden=true;refreshCounts();toast('정산을 저장했습니다.');}catch(err){$('form-error').textContent='저장하지 못했습니다. '+err.message;$('form-error').hidden=false;}finally{$('save-btn').disabled=false;}});
 $('op-apply').onclick=()=>{const r=renderOption();if(r.errors.length)return;sourceOption={inputs:readOption(),result:r};$('option-recognized').value=String(round(r.recognizedUsd));$('sale-option').value=String(round(r.settlementUsd));renderCalc();toast('옵션 인정매출과 정산매출을 각각 반영했습니다.');};
 $('reset-btn').onclick=()=>confirmAction('새 팀을 입력할까요?','저장하지 않은 입력 내용은 지워집니다. 저장된 기록은 유지됩니다.',resetForm);
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 $('rates-open').onclick=()=>$('rates-dialog').showModal();document.querySelectorAll('.close-rates').forEach(b=>b.onclick=()=>$('rates-dialog').close());$('dialog-cancel').onclick=()=>$('confirm-dialog').close();
 $('history-month').onchange=renderHistory;$('stats-month').onchange=renderStats;$('all-records').onclick=()=>{$('history-month').value='';renderHistory();};
-$('history-list').onclick=e=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit){const r=records.find(x=>x.id===edit.dataset.edit);if(PREVIOUS_VERSIONS.includes(r.ruleVersion)){editing=null;fillInput({...r.input,name:(r.input.name+' · 재검토').slice(0,100),reviewOf:r.id});$('review-notice').hidden=false;$('review-notice').textContent='이전 기록은 그대로 보존됩니다. 현재 자동 공제 기준으로 계산한 별도 검토본입니다.';$('form-title').textContent='이전 정산을 새 기준으로 검토';$('save-btn').textContent='새 검토본 저장';}else if(r.ruleVersion===LEGACY_VERSION){const old=r.input;editing=null;const mapped=old.sales.length===4?[old.sales[0],0,old.sales[1],0,old.sales[2],old.sales[3]]:[...old.sales];fillInput({...freshInput(),date:old.date,name:(old.name+' · 재검토').slice(0,100),couples:old.couples,bus:old.bus,sales:mapped,optionRecognized:mapped[5]===0?0:null,fx:r.result.shopFx,optionFx:r.result.optionFx,carOverride:r.result.car===(old.bus?10000:CAR[old.couples])?null:r.result.car,bonusOverride:r.result.bonus,extraBonus:old.extraBonus??0,adjustment:old.adjustment??0,actual:old.actual??null,krwFx:old.krwFx??null,actualKrw:old.actualKrw??null,reviewOf:r.id});$('review-notice').hidden=false;$('review-notice').textContent='이전 기록은 그대로 보존됩니다. 옵션 인정매출을 확인해 입력하세요.'+(old.sales.length===4?' 이전 A/B는 매장 미분류이므로 올바른 매장으로 옮겨주세요.':'');$('form-title').textContent='이전 정산을 새 기준으로 검토';$('save-btn').textContent='새 검토본 저장';}else{editing=r.id;fillInput(r.input);$('review-notice').hidden=true;$('form-title').textContent='저장된 팀 정산 수정';$('save-btn').textContent='수정 내용 저장';}$('editing-chip').hidden=!editing;switchTab('calc');window.scrollTo({top:0,behavior:'smooth'});}if(del)confirmAction('이 정산을 삭제할까요?','삭제 전에 필요한 기록은 백업해 주세요.',()=>{try{persist(records.filter(r=>r.id!==del.dataset.delete));if(editing===del.dataset.delete)resetForm();renderHistory();toast('기록을 삭제했습니다.');}catch(err){toast(err.message);}});};
+$('history-list').onclick=e=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit){const r=records.find(x=>x.id===edit.dataset.edit);if(PREVIOUS_VERSIONS.includes(r.ruleVersion)){editing=null;fillInput(reviewInput({...r.input,name:(r.input.name+' · 재검토').slice(0,100),reviewOf:r.id}));$('review-notice').hidden=false;$('review-notice').textContent='이전 기록은 그대로 보존됩니다. 현재 자동 공제 기준으로 계산한 별도 검토본입니다.';$('form-title').textContent='이전 정산을 새 기준으로 검토';$('save-btn').textContent='새 검토본 저장';}else if(r.ruleVersion===LEGACY_VERSION){const old=r.input;editing=null;const mapped=old.sales.length===4?[old.sales[0],0,old.sales[1],0,old.sales[2],old.sales[3]]:[...old.sales];fillInput({...freshInput(),date:old.date,name:(old.name+' · 재검토').slice(0,100),couples:old.couples,bus:old.bus,sales:mapped,optionRecognized:mapped[5]===0?0:null,fx:r.result.shopFx,optionFx:r.result.optionFx,carOverride:r.result.car===(old.bus?10000:CAR[old.couples])?null:r.result.car,bonusOverride:r.result.bonus,extraBonus:old.extraBonus??0,adjustment:old.adjustment??0,actual:old.actual??null,krwFx:old.krwFx??null,actualKrw:old.actualKrw??null,reviewOf:r.id});$('review-notice').hidden=false;$('review-notice').textContent='이전 기록은 그대로 보존됩니다. 옵션 인정매출을 확인해 입력하세요.'+(old.sales.length===4?' 이전 A/B는 매장 미분류이므로 올바른 매장으로 옮겨주세요.':'');$('form-title').textContent='이전 정산을 새 기준으로 검토';$('save-btn').textContent='새 검토본 저장';}else{editing=r.id;fillInput(r.input);$('review-notice').hidden=true;$('form-title').textContent='저장된 팀 정산 수정';$('save-btn').textContent='수정 내용 저장';}$('editing-chip').hidden=!editing;switchTab('calc');window.scrollTo({top:0,behavior:'smooth'});}if(del)confirmAction('이 정산을 삭제할까요?','삭제 전에 필요한 기록은 백업해 주세요.',async()=>{try{await persist(records.filter(r=>r.id!==del.dataset.delete));if(editing===del.dataset.delete)resetForm();renderHistory();toast('기록을 삭제했습니다.');}catch(err){toast(err.message);}});};
 $('export-json').onclick=()=>download(JSON.stringify({format:'nirvana-honeymoon',version:1,exportedAt:new Date().toISOString(),records,preferences:prefs},null,2),'정산노트_백업_'+today()+'.json','application/json');
 $('export-raw').onclick=()=>download(localStorage.getItem(KEY)||'[]','정산노트_원본_'+today()+'.json','application/json');
-$('import-json').onclick=()=>$('import-file').click();$('import-file').onchange=async e=>{const file=e.target.files[0];e.target.value='';if(!file)return;try{if(file.size>10*1024*1024)throw Error('10MB 이하 파일만 불러올 수 있습니다.');const data=JSON.parse(await file.text());if(data.format!=='nirvana-honeymoon'||data.version!==1)throw Error('정산노트 백업 파일을 선택해 주세요.');const incoming=validateRecords(data.records),ids=new Set(records.map(r=>r.id)),fresh=incoming.filter(r=>!ids.has(r.id));if(storageBroken)throw Error('손상된 원본을 먼저 백업하고 복구를 요청해 주세요. 원본 데이터는 덮어쓰지 않습니다.');confirmAction('백업을 불러올까요?',`새 기록 ${fresh.length}개를 추가합니다. 기존 기록과 저장된 계산 결과는 그대로 유지합니다.`,()=>{try{persist([...records,...fresh]);renderHistory();toast('백업을 불러왔습니다.');}catch(err){toast(err.message);}});}catch(err){toast(err.message);}};
+$('import-json').onclick=()=>$('import-file').click();$('import-file').onchange=async e=>{const file=e.target.files[0];e.target.value='';if(!file)return;try{if(file.size>10*1024*1024)throw Error('10MB 이하 파일만 불러올 수 있습니다.');const data=JSON.parse(await file.text());if(data.format!=='nirvana-honeymoon'||data.version!==1)throw Error('정산노트 백업 파일을 선택해 주세요.');const incoming=validateRecords(data.records),ids=new Set(records.map(r=>r.id)),fresh=incoming.filter(r=>!ids.has(r.id));if(storageBroken)throw Error('손상된 원본을 먼저 백업하고 복구를 요청해 주세요. 원본 데이터는 덮어쓰지 않습니다.');confirmAction('백업을 불러올까요?',`새 기록 ${fresh.length}개를 추가합니다. 기존 기록과 저장된 계산 결과는 그대로 유지합니다.`,async()=>{try{await persist([...records,...fresh]);renderHistory();toast('백업을 불러왔습니다.');}catch(err){toast(err.message);}});}catch(err){toast(err.message);}};
 $('export-csv').onclick=()=>{const list=selectedRecords($('history-month').value);if(!list.length){toast('내보낼 기록이 없습니다.');return;}const columns=['정산일','팀','규칙버전','쌍수',...LABELS.map(x=>x+' 정산매출 USD'),'이전 A 미분류 USD','이전 B 미분류 USD','옵션 인정매출 USD','구간 산정 총매출 USD','쌍당 매출 USD','A %','B %','C %','옵션 %','샵 적용환율','옵션 적용환율','반올림','수수료 THB','차량비 THB','매출 보너스 THB','추가 보너스 THB','이전 기록의 별도 공제 THB','상조회비 THB','기타 조정 THB','예상 THB','회사 지급 THB','차이 THB','원화 환율','예상 KRW','회사 지급 KRW','차이 KRW'];const rows=[columns,...list.map(({input:d,result:c,ruleVersion})=>[d.date,d.name,ruleVersion,d.couples,...(d.sales.length===6?[...d.sales,0,0]:[0,0,0,0,d.sales[2],d.sales[3],d.sales[0],d.sales[1]]),d.optionRecognized??'',c.total,c.average,...c.tier.r,c.shopFx,c.optionFx,d.rounding??'이전 방식',c.gross,c.car,c.bonus,d.extraBonus,d.deposit??0,d.association??0,d.adjustment,c.net,d.actual,c.difference,d.krwFx,c.krwNet,d.actualKrw,c.krwDifference])];const cell=v=>{let s=String(v??'');if(typeof v==='string'&&/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';};download('\uFEFF'+rows.map(r=>r.map(cell).join(',')).join('\r\n'),'정산노트_'+($('history-month').value||'전체')+'.csv','text/csv;charset=utf-8');};
 let baseline='';function rememberBaseline(){baseline=JSON.stringify(readInput());}const originalReset=resetForm;resetForm=function(){originalReset();rememberBaseline();};
 window.addEventListener('beforeunload',e=>{const saved=records.find(r=>r.id===editing),current=JSON.stringify(readInput());if(current!==(saved?JSON.stringify(saved.input):baseline)){e.preventDefault();e.returnValue='';}});
